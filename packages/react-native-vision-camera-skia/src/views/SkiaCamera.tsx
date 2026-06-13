@@ -202,6 +202,14 @@ const DEFAULT_PIXEL_FORMAT = Platform.select<TargetVideoPixelFormat>({
   android: 'native',
 })
 
+// The Camera Thread produces preview frames faster than the RN Thread can
+// consume them. Without a bound, the `scheduleOnRN` queue accumulates
+// multi-MB CPU copies (one per Frame) and grows the native heap unbounded
+// until the OS kills the app. We allow at most this many CPU copies to be
+// in-flight towards the RN Thread; excess Frames are dropped (and disposed)
+// at the producer, so a slow consumer degrades preview FPS instead of OOM-ing.
+const MAX_IN_FLIGHT_PREVIEW_FRAMES = 2
+
 function SkiaCameraImpl({
   ref,
   style,
@@ -225,6 +233,9 @@ function SkiaCameraImpl({
     () => createSynchronizable<boolean | undefined>(undefined),
     [],
   )
+  // Number of preview CPU copies currently queued towards the RN Thread.
+  // Incremented atomically on the Camera Thread, decremented on the RN Thread.
+  const inFlightPreviewFrames = useMemo(() => createSynchronizable<number>(0), [])
 
   const canvasSize = useSharedValue({ width: 0, height: 0 })
   const canvasRect = useDerivedValue(() => {
@@ -243,8 +254,9 @@ function SkiaCameraImpl({
       if (oldTexture != null) {
         oldTexture.dispose()
       }
+      inFlightPreviewFrames.setBlocking((n) => (n > 0 ? n - 1 : 0))
     },
-    [texture],
+    [texture, inFlightPreviewFrames],
   )
 
   const frameOutput = useFrameOutput({
@@ -274,8 +286,23 @@ function SkiaCameraImpl({
               `Failed to copy rendered GPU contents to CPU Image!`,
             )
           }
-          // 3. Update our Preview with the currently rendered result (and info)
-          scheduleOnRN(updatePreviewTexture, snapshotCpuCopy)
+          // 3. Apply backpressure: only hand the copy to the RN Thread if the
+          //    in-flight queue has room. Atomically reserve a slot; if full,
+          //    drop this Frame and dispose its copy so memory stays bounded.
+          let reservedSlot = false
+          inFlightPreviewFrames.setBlocking((n) => {
+            if (n < MAX_IN_FLIGHT_PREVIEW_FRAMES) {
+              reservedSlot = true
+              return n + 1
+            }
+            return n
+          })
+          if (reservedSlot) {
+            // 4. Update our Preview with the currently rendered result (and info)
+            scheduleOnRN(updatePreviewTexture, snapshotCpuCopy)
+          } else {
+            snapshotCpuCopy.dispose()
+          }
           lastFrameOrientation.setBlocking(frame.orientation)
           lastFrameIsMirrored.setBlocking(frame.isMirrored)
         } catch (e) {
@@ -377,10 +404,16 @@ function SkiaCameraImpl({
 
   useEffect(() => {
     return () => {
-      // On unmount, clear the Surfaces cache to free up memory.
+      // On unmount, dispose the last held preview texture and clear the
+      // Surfaces cache to free up memory.
+      const lastTexture = texture.get()
+      if (lastTexture != null) {
+        lastTexture.dispose()
+        texture.set(null)
+      }
       clearSurfacesCache()
     }
-  }, [])
+  }, [texture])
 
   return (
     <Canvas style={style} onSize={canvasSize}>
