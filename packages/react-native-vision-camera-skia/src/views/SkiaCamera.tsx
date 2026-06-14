@@ -287,8 +287,7 @@ function SkiaCameraImpl({
             )
           }
           // 3. Apply backpressure: only hand the copy to the RN Thread if the
-          //    in-flight queue has room. Atomically reserve a slot; if full,
-          //    drop this Frame and dispose its copy so memory stays bounded.
+          //    in-flight queue has room (bounds the scheduleOnRN queue depth).
           let reservedSlot = false
           inFlightPreviewFrames.setBlocking((n) => {
             if (n < MAX_IN_FLIGHT_PREVIEW_FRAMES) {
@@ -298,11 +297,13 @@ function SkiaCameraImpl({
             return n
           })
           if (reservedSlot) {
-            // 4. Update our Preview with the currently rendered result (and info)
             scheduleOnRN(updatePreviewTexture, snapshotCpuCopy)
-          } else {
-            snapshotCpuCopy.dispose()
           }
+          // scheduleOnRN synchronously serializes a ref-counted clone for the RN
+          // Thread, so the producer must release its own reference here — otherwise
+          // each frame's multi-MB CPU copy leaks (worklet-runtime GC can't keep up
+          // at camera frame rate). The RN-Thread copy is disposed in updatePreviewTexture.
+          snapshotCpuCopy.dispose()
           lastFrameOrientation.setBlocking(frame.orientation)
           lastFrameIsMirrored.setBlocking(frame.isMirrored)
         } catch (e) {
